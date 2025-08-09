@@ -9,6 +9,8 @@ from discord import app_commands
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from typing import Dict, List, Optional, Tuple, Any
+from threading import Thread
+from flask import Flask
 
 # Load environment variables
 load_dotenv()
@@ -26,6 +28,28 @@ COMPETITIVE_MODES = ["Competitive", "competitive"]  # Possible competitive mode 
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
+
+# Flask web server to keep the bot alive on Render
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Valorant Discord Bot is running! Bot status: Ready for commands."
+
+@app.route('/health')
+def health():
+    return {"status": "healthy", "bot": "online"}
+
+def run():
+    # Get the port from the environment variable provided by Render
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
+
+def keep_alive():
+    # Start the Flask app in a separate thread
+    server_thread = Thread(target=run)
+    server_thread.daemon = True
+    server_thread.start()
 
 # Utility functions for JSON file operations and user management
 def load_json_file(file_path: str) -> List[Dict[str, Any]]:
@@ -1012,7 +1036,46 @@ def create_comprehensive_match_embed(match_data, username, tag, region):
                 first_kills = 0  # This would need match kill data analysis
                 first_deaths = 0
                 multikills = 0
-                
+
+                # Analyze kills data for FK/FD/MK
+                if 'kills' in match_data:
+                    kills_data = match_data['kills']
+
+                    # Group kills by round
+                    kills_by_round = {}
+                    for kill_event in kills_data:
+                        round_number = kill_event.get('round', 0)
+                        if round_number not in kills_by_round:
+                            kills_by_round[round_number] = []
+                        kills_by_round[round_number].append(kill_event)
+                    
+                    # Check each round for first kills/deaths and count player's kills per round
+                    for round_num, round_kills in kills_by_round.items():
+                        # Sort by kills to find first kill/death
+                        round_kills.sort(key=lambda x: x.get('kill_time_in_round', 0))
+
+                        # Count kills by this player in this round
+                        player_kills_this_round = 0
+
+                        for i, kill_event in enumerate(round_kills):
+                            killer_puuid = kill_event.get('killer_puuid')
+                            victim_puuid = kill_event.get('victim_puuid')
+
+                            # Count kills by this player
+                            if killer_puuid == player_puuid:
+                                player_kills_this_round += 1
+
+                                # First kill of the round
+                                if i == 0:
+                                    first_kills += 1
+                            
+                            # First death of the round
+                            if victim_puuid == player_puuid and i == 0:
+                                first_deaths += 1
+                        # Count multikills (3+ kills in a round)
+                        if player_kills_this_round >= 3:
+                            multikills += 1
+
                 # Plus/minus
                 plus_minus = kills - deaths
                 plus_minus_str = f"+{plus_minus}" if plus_minus > 0 else str(plus_minus)
@@ -3491,4 +3554,9 @@ async def slash_show_linked(interaction: discord.Interaction):
         await interaction.response.send_message("❌ Error retrieving linked accounts.", ephemeral=True)
 
 if __name__ == "__main__":
-    bot.run(os.getenv('DISCORD_BOT_TOKEN'))
+    DISCORD_BOT_TOKEN = os.getenv('DISCORD_BOT_TOKEN')
+    if not DISCORD_BOT_TOKEN:
+        print("Error: DISCORD_BOT_TOKEN not found in environment variables.")
+    else:
+        keep_alive()  # Start the web server
+        bot.run(DISCORD_BOT_TOKEN)
