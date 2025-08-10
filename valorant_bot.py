@@ -1988,7 +1988,20 @@ async def slash_economy_analysis(interaction: discord.Interaction, player: str =
         )
 
 def analyze_clutch_data(matches: List[Dict[str, Any]], username: str, tag: str) -> Dict[str, Any]:
-    """Analyze clutch statistics from match data"""
+    """
+    Analyze clutch statistics from match data.
+    
+    A clutch situation is defined as a 1vX scenario where a player is the last alive
+    on their team facing multiple enemies, and they need to win the round.
+    
+    Args:
+        matches: List of match data dictionaries
+        username: Player's username to analyze
+        tag: Player's tag to analyze
+        
+    Returns:
+        Dictionary containing clutch statistics including attempts, wins, and performance breakdowns
+    """
     clutch_stats = {
         '1v1': {'attempts': 0, 'wins': 0},
         '1v2': {'attempts': 0, 'wins': 0},
@@ -2000,139 +2013,390 @@ def analyze_clutch_data(matches: List[Dict[str, Any]], username: str, tag: str) 
         'best_clutch': None,
         'clutch_maps': {},
         'clutch_agents': {},
-        'total_matches': len(matches) if matches else 0
+        'total_matches': len(matches) if matches else 0,
+        'data_limitation': False  # Track if we have limited data
     }
     
     if not matches:
         return clutch_stats
+    
+    matches_with_detailed_data = 0
+    matches_with_basic_data = 0
     
     for match in matches:
         rounds_data = match.get('rounds', [])
         kills_data = match.get('kills', [])
         players_data = match.get('players', [])
         
-        # Find our player's data
-        our_player = None
-        for player in players_data:
-            if (player.get('name', '').lower() == username.lower() and 
-                player.get('tag', '') == tag):
-                our_player = player
-                break
-        
-        if not our_player:
-            continue
-        
-        player_team = our_player.get('team', '').lower()
-        map_name = match.get('match_info', {}).get('map', 'Unknown')
-        agent = our_player.get('agent', 'Unknown')
-        
-        # Analyze each round for clutch situations
-        for round_data in rounds_data:
-            clutch_situation = _analyze_round_for_clutch(round_data, kills_data, our_player, player_team)
-            
-            if clutch_situation:
-                clutch_type = clutch_situation['type']  # e.g., '1v2'
-                won = clutch_situation['won']
-                
-                if clutch_type in clutch_stats:
-                    clutch_stats[clutch_type]['attempts'] += 1
-                    clutch_stats['total_clutches'] += 1
-                    
-                    if won:
-                        clutch_stats[clutch_type]['wins'] += 1
-                        clutch_stats['total_wins'] += 1
-                        
-                        # Track best clutch
-                        if not clutch_stats['best_clutch'] or _is_better_clutch(clutch_type, clutch_stats['best_clutch']):
-                            clutch_stats['best_clutch'] = {
-                                'type': clutch_type,
-                                'map': map_name,
-                                'agent': agent,
-                                'round': round_data.get('round_num', 0)
-                            }
-                    
-                    # Track clutch performance by map
-                    if map_name not in clutch_stats['clutch_maps']:
-                        clutch_stats['clutch_maps'][map_name] = {'attempts': 0, 'wins': 0}
-                    clutch_stats['clutch_maps'][map_name]['attempts'] += 1
-                    if won:
-                        clutch_stats['clutch_maps'][map_name]['wins'] += 1
-                    
-                    # Track clutch performance by agent
-                    if agent not in clutch_stats['clutch_agents']:
-                        clutch_stats['clutch_agents'][agent] = {'attempts': 0, 'wins': 0}
-                    clutch_stats['clutch_agents'][agent]['attempts'] += 1
-                    if won:
-                        clutch_stats['clutch_agents'][agent]['wins'] += 1
+        # Check if this match has detailed round data
+        if rounds_data and kills_data and len(rounds_data) > 0:
+            matches_with_detailed_data += 1
+            # Use the detailed analysis with proper API structure
+            _analyze_detailed_clutch_data(match, username, tag, clutch_stats)
+        else:
+            matches_with_basic_data += 1
+            # Use simplified analysis based on available data
+            _analyze_basic_clutch_data(match, username, tag, clutch_stats)
+    
+    # Mark if we had data limitations
+    if matches_with_basic_data > 0:
+        clutch_stats['data_limitation'] = True
+        clutch_stats['matches_with_detailed_data'] = matches_with_detailed_data
+        clutch_stats['matches_with_basic_data'] = matches_with_basic_data
     
     return clutch_stats
 
-def _analyze_round_for_clutch(round_data: Dict[str, Any], kills_data: List[Dict[str, Any]], 
-                             our_player: Dict[str, Any], player_team: str) -> Optional[Dict[str, Any]]:
-    """Analyze a round to determine if it was a clutch situation"""
+def _analyze_detailed_clutch_data(match: Dict[str, Any], username: str, tag: str, clutch_stats: Dict[str, Any]):
+    """
+    Analyze clutch data from matches with detailed round and kill information.
+    
+    This function processes the full API response structure including:
+    - Round-by-round data with winning teams
+    - Detailed kill events with timing and player information
+    - Chronological analysis of team status throughout each round
+    
+    Args:
+        match: Match data dictionary containing rounds and kills arrays
+        username: Target player's username
+        tag: Target player's tag
+        clutch_stats: Statistics dictionary to update with findings
+    """
+    rounds_data = match.get('rounds', [])
+    kills_data = match.get('kills', [])
+    players_data = match.get('players', [])
+    
+    # Find our player's data
+    our_player = None
+    for player in players_data:
+        if (player.get('is_requested_player', False) or 
+            (player.get('name', '').lower() == username.lower() and 
+             player.get('tag', '') == tag)):
+            our_player = player
+            break
+    
+    if not our_player:
+        return
+    
+    player_puuid = our_player.get('puuid', '')
+    player_team = our_player.get('team', '').lower()
+    map_name = match.get('match_info', {}).get('map', 'Unknown')
+    agent = our_player.get('agent', 'Unknown')
+    
+    # Analyze each round for clutch situations
+    for round_index, round_data in enumerate(rounds_data):
+        round_number = round_index + 1
+        winning_team = round_data.get('winning_team', '').lower()
+        
+        # Get kills for this round (using round number as filter)
+        round_kills = []
+        for kill in kills_data:
+            # Calculate which round this kill belongs to based on timing
+            # This is a simplified approach - ideally we'd have round number in kill data
+            kill_round = _estimate_round_from_kill_time(kill, round_index, len(rounds_data))
+            if kill_round == round_number:
+                round_kills.append(kill)
+        
+        # Analyze this round for clutch situations
+        clutch_situation = _analyze_round_for_clutch_detailed(
+            round_data, round_kills, player_puuid, player_team, winning_team, round_number
+        )
+        
+        if clutch_situation:
+            clutch_type = clutch_situation['type']
+            won = clutch_situation['won']
+            
+            if clutch_type in clutch_stats:
+                clutch_stats[clutch_type]['attempts'] += 1
+                clutch_stats['total_clutches'] += 1
+                
+                if won:
+                    clutch_stats[clutch_type]['wins'] += 1
+                    clutch_stats['total_wins'] += 1
+                    
+                    # Track best clutch
+                    if not clutch_stats['best_clutch'] or _is_better_clutch(clutch_type, clutch_stats['best_clutch']):
+                        clutch_stats['best_clutch'] = {
+                            'type': clutch_type,
+                            'map': map_name,
+                            'agent': agent,
+                            'round': round_number
+                        }
+                
+                # Track clutch performance by map
+                if map_name not in clutch_stats['clutch_maps']:
+                    clutch_stats['clutch_maps'][map_name] = {'attempts': 0, 'wins': 0}
+                clutch_stats['clutch_maps'][map_name]['attempts'] += 1
+                if won:
+                    clutch_stats['clutch_maps'][map_name]['wins'] += 1
+                
+                # Track clutch performance by agent
+                if agent not in clutch_stats['clutch_agents']:
+                    clutch_stats['clutch_agents'][agent] = {'attempts': 0, 'wins': 0}
+                clutch_stats['clutch_agents'][agent]['attempts'] += 1
+                if won:
+                    clutch_stats['clutch_agents'][agent]['wins'] += 1
+
+def _estimate_round_from_kill_time(kill: Dict[str, Any], round_index: int, total_rounds: int) -> int:
+    """Estimate which round a kill belongs to based on timing"""
+    kill_time_in_match = kill.get('kill_time_in_match', 0)
+    
+    # Simple estimation: divide match time by rounds
+    # This is approximate since rounds have different lengths
+    if total_rounds > 0:
+        estimated_round_duration = kill_time_in_match / total_rounds if kill_time_in_match > 0 else 0
+        if estimated_round_duration > 0:
+            estimated_round = min(int(kill_time_in_match / estimated_round_duration) + 1, total_rounds)
+            return estimated_round
+    
+    # Fallback: assume kill belongs to the round we're currently analyzing
+    return round_index + 1
+
+def _analyze_round_for_clutch_detailed(round_data: Dict[str, Any], round_kills: List[Dict[str, Any]], 
+                                     player_puuid: str, player_team: str, winning_team: str, round_number: int) -> Optional[Dict[str, Any]]:
+    """
+    Analyze a specific round to detect clutch situations using detailed API data.
+    
+    Process:
+    1. Track team alive counts as kills occur chronologically
+    2. Detect when target player becomes last alive (1vX situation)
+    3. Verify if player wins the clutch by checking round outcome
+    4. Calculate clutch type based on number of enemies faced
+    
+    Args:
+        round_data: Round information from API
+        round_kills: List of kills that occurred in this round
+        player_puuid: Target player's PUUID
+        player_team: Target player's team ('red' or 'blue')
+        winning_team: Which team won this round
+        round_number: Round number for tracking
+        
+    Returns:
+        Dict with clutch information if detected, None otherwise
+    """
     try:
-        round_num = round_data.get('round_num', 0)
-        player_puuid = our_player.get('puuid', '')
+        # Track alive players throughout the round
+        team_alive = {'red': 5, 'blue': 5}  # Start with 5 players per team
+        our_team_alive = 5
+        enemy_team_alive = 5
         
-        # Get kills for this round
-        round_kills = [k for k in kills_data if k.get('round', 0) == round_num]
-        
-        if not round_kills:
-            return None
-        
-        # Sort kills by time
+        # Sort kills by time within round
         round_kills.sort(key=lambda x: x.get('kill_time_in_round', 0))
         
-        # Find when our player might be in a clutch situation
-        # This is a simplified analysis - would need more detailed round state tracking
+        our_player_killed = False
+        our_kills_in_round = []
+        clutch_detected = False
+        enemies_faced = 0
         
-        # Check if our player survived longer than teammates in the round
-        our_death_time = None
-        teammate_deaths = []
-        enemy_deaths = []
-        
+        # Process each kill in chronological order
         for kill in round_kills:
             victim_puuid = kill.get('victim_puuid')
             killer_puuid = kill.get('killer_puuid')
-            kill_time = kill.get('kill_time_in_round', 0)
+            victim_team = kill.get('victim_team', '').lower()
+            killer_team = kill.get('killer_team', '').lower()
             
-            # Track our player's death
+            # Check if our player was killed
             if victim_puuid == player_puuid:
-                our_death_time = kill_time
+                our_player_killed = True
+                break  # Can't clutch if dead
             
-            # For simplification, we'll assume clutch if player had kills late in round
-            # In reality, you'd need full round state tracking
-        
-        # Simplified clutch detection based on kills in round
-        our_kills_in_round = [k for k in round_kills if k.get('killer_puuid') == player_puuid]
-        
-        if len(our_kills_in_round) >= 2:  # Multi-kill indicates potential clutch
-            # Determine clutch type based on number of kills
-            kill_count = len(our_kills_in_round)
-            if kill_count == 2:
-                clutch_type = '1v2'
-            elif kill_count == 3:
-                clutch_type = '1v3'
-            elif kill_count == 4:
-                clutch_type = '1v4'
-            elif kill_count >= 5:
-                clutch_type = '1v5'
+            # Track our player's kills
+            if killer_puuid == player_puuid:
+                our_kills_in_round.append(kill)
+                if victim_team != player_team.lower():
+                    enemy_team_alive -= 1
+            
+            # Update team counts
+            if victim_team == 'red':
+                team_alive['red'] -= 1
+            elif victim_team == 'blue':
+                team_alive['blue'] -= 1
+            
+            # Determine our team status
+            if player_team.lower() == 'red':
+                our_team_alive = team_alive['red']
+                enemy_team_alive = team_alive['blue']
             else:
-                clutch_type = '1v1'
+                our_team_alive = team_alive['blue']
+                enemy_team_alive = team_alive['red']
             
-            # Determine if clutch was won (player survived or got the final kill)
-            won = our_death_time is None or our_death_time > max(k.get('kill_time_in_round', 0) for k in our_kills_in_round)
+            # Check for clutch situation: our player alone vs multiple enemies
+            if our_team_alive == 1 and enemy_team_alive > 1:
+                if not clutch_detected:
+                    clutch_detected = True
+                    enemies_faced = enemy_team_alive
+        
+        # Determine if clutch was successful
+        if clutch_detected and not our_player_killed:
+            # Check if our team won the round
+            round_won = (winning_team == player_team.lower())
+            clutch_type = f'1v{enemies_faced}'
             
             return {
                 'type': clutch_type,
-                'won': won,
-                'kills': kill_count,
-                'round': round_num
+                'won': round_won,
+                'kills': len(our_kills_in_round),
+                'round': round_number,
+                'enemies_faced': enemies_faced
+            }
+        
+        # Alternative detection: if player got multiple kills late in round and team won
+        elif len(our_kills_in_round) >= 2 and not our_player_killed and winning_team == player_team.lower():
+            # This might be a clutch we missed in the chronological analysis
+            # Estimate based on kills
+            estimated_enemies = min(len(our_kills_in_round), 5)
+            clutch_type = f'1v{estimated_enemies}'
+            
+            return {
+                'type': clutch_type,
+                'won': True,
+                'kills': len(our_kills_in_round),
+                'round': round_number,
+                'enemies_faced': estimated_enemies
             }
         
         return None
+        
     except Exception:
+        # Silently handle errors in clutch analysis
         return None
+
+def _analyze_basic_clutch_data(match: Dict[str, Any], username: str, tag: str, clutch_stats: Dict[str, Any]):
+    """Analyze clutch data from basic match information (simplified estimation)"""
+    players_data = match.get('players', [])
+    
+    # Find our player's data
+    our_player = None
+    for player in players_data:
+        if (player.get('is_requested_player', False) or 
+            (player.get('name', '').lower() == username.lower() and 
+             player.get('tag', '') == tag)):
+            our_player = player
+            break
+    
+    if not our_player:
+        return
+    
+    player_stats = our_player.get('stats', {})
+    map_name = match.get('match_info', {}).get('map', 'Unknown')
+    agent = our_player.get('agent', 'Unknown')
+    
+    # Get team info to determine win/loss
+    player_team = our_player.get('team', '').lower()
+    match_info = match.get('match_info', {})
+    red_rounds = match_info.get('red_rounds', 0)
+    blue_rounds = match_info.get('blue_rounds', 0)
+    won_match = ((player_team == 'red' and red_rounds > blue_rounds) or 
+                (player_team == 'blue' and blue_rounds > red_rounds))
+    
+    # Extract stats for estimation
+    kills = player_stats.get('kills', 0)
+    deaths = player_stats.get('deaths', 0)
+    kda = player_stats.get('kda', 0)
+    kast = player_stats.get('kast', 0)
+    plus_minus = player_stats.get('plus_minus', 0)
+    rounds_played = match_info.get('rounds_played', 13)
+    
+    # More sophisticated clutch estimation based on performance metrics
+    estimated_clutches = 0
+    estimated_wins = 0
+    
+    # Factor 1: High kill count suggests active engagement
+    if kills >= 20:
+        estimated_clutches += 2
+    elif kills >= 15:
+        estimated_clutches += 1
+    
+    # Factor 2: High KAST suggests surviving to late rounds
+    if kast >= 75:
+        estimated_clutches += 1
+    
+    # Factor 3: Good K/D suggests winning duels
+    if kda >= 1.3:
+        estimated_clutches += 1
+    
+    # Factor 4: Long matches (overtime) increase clutch probability
+    if rounds_played >= 25:
+        estimated_clutches += 1
+    elif rounds_played >= 22:
+        estimated_clutches += 1
+    
+    # Cap estimated clutches at reasonable number
+    estimated_clutches = min(estimated_clutches, 3)
+    
+    # Estimate wins based on performance
+    if estimated_clutches > 0:
+        win_probability = 0
+        
+        # Base win rate on K/D and match outcome
+        if kda >= 1.5 and won_match:
+            win_probability = 0.6
+        elif kda >= 1.2 and won_match:
+            win_probability = 0.4
+        elif kda >= 1.0 and won_match:
+            win_probability = 0.3
+        elif kda >= 1.2:  # Good performance even in loss
+            win_probability = 0.25
+        elif kda >= 1.0:
+            win_probability = 0.15
+        else:
+            win_probability = 0.1
+        
+        # Boost win probability for high KAST (suggests good positioning)
+        if kast >= 80:
+            win_probability += 0.1
+        elif kast >= 70:
+            win_probability += 0.05
+        
+        estimated_wins = min(int(estimated_clutches * win_probability), estimated_clutches)
+    
+    # Distribute estimated clutches across types (favor more common scenarios)
+    if estimated_clutches > 0:
+        # Distribution: 60% 1v1, 30% 1v2, 10% 1v3+
+        clutch_1v1 = max(1, int(estimated_clutches * 0.6))
+        clutch_1v2 = max(0, int(estimated_clutches * 0.3))
+        clutch_1v3 = estimated_clutches - clutch_1v1 - clutch_1v2
+        
+        # Distribute wins proportionally
+        wins_1v1 = int(estimated_wins * 0.6) if estimated_wins > 0 else 0
+        wins_1v2 = int(estimated_wins * 0.3) if estimated_wins > 0 else 0
+        wins_1v3 = estimated_wins - wins_1v1 - wins_1v2
+        
+        # Update stats
+        clutch_stats['1v1']['attempts'] += clutch_1v1
+        clutch_stats['1v1']['wins'] += wins_1v1
+        
+        if clutch_1v2 > 0:
+            clutch_stats['1v2']['attempts'] += clutch_1v2
+            clutch_stats['1v2']['wins'] += wins_1v2
+        
+        if clutch_1v3 > 0:
+            clutch_type = '1v3' if estimated_clutches <= 2 else '1v4'
+            clutch_stats[clutch_type]['attempts'] += clutch_1v3
+            clutch_stats[clutch_type]['wins'] += wins_1v3
+        
+        clutch_stats['total_clutches'] += estimated_clutches
+        clutch_stats['total_wins'] += estimated_wins
+        
+        # Set best clutch if we estimated a win
+        if estimated_wins > 0 and not clutch_stats['best_clutch']:
+            best_type = '1v3' if clutch_1v3 > 0 and wins_1v3 > 0 else ('1v2' if clutch_1v2 > 0 and wins_1v2 > 0 else '1v1')
+            clutch_stats['best_clutch'] = {
+                'type': best_type,
+                'map': map_name,
+                'agent': agent,
+                'round': 'estimated'
+            }
+        
+        # Track by map and agent
+        if map_name not in clutch_stats['clutch_maps']:
+            clutch_stats['clutch_maps'][map_name] = {'attempts': 0, 'wins': 0}
+        clutch_stats['clutch_maps'][map_name]['attempts'] += estimated_clutches
+        clutch_stats['clutch_maps'][map_name]['wins'] += estimated_wins
+        
+        if agent not in clutch_stats['clutch_agents']:
+            clutch_stats['clutch_agents'][agent] = {'attempts': 0, 'wins': 0}
+        clutch_stats['clutch_agents'][agent]['attempts'] += estimated_clutches
+        clutch_stats['clutch_agents'][agent]['wins'] += estimated_wins
 
 def _is_better_clutch(new_clutch_type: str, current_best: Dict[str, Any]) -> bool:
     """Determine if a new clutch is better than the current best"""
@@ -2165,12 +2429,57 @@ def create_clutch_embed(clutch_stats: Dict[str, Any], username: str, tag: str, d
     total_wins = clutch_stats['total_wins']
     overall_clutch_rate = calc_percentage(total_wins, total_attempts)
     
+    # Check for data limitations
+    has_limitations = clutch_stats.get('data_limitation', False)
+    matches_with_detailed = clutch_stats.get('matches_with_detailed_data', 0)
+    matches_with_basic = clutch_stats.get('matches_with_basic_data', 0)
+    
+    embed_color = 0x00FF00 if overall_clutch_rate >= 30 else 0xFF9900 if overall_clutch_rate >= 15 else 0xFF4655
+    if has_limitations:
+        embed_color = 0xFFFF00  # Yellow for limited data
+    
+    description = f"Clutch performance over the last **{days} days** ({clutch_stats['total_matches']} matches)"
+    if has_limitations:
+        if total_attempts == 0:
+            description += f"\n⚠️ **Limited data available** - Using basic match stats for estimation"
+        else:
+            description += f"\n⚠️ **Mixed data sources** - {matches_with_detailed} detailed, {matches_with_basic} estimated"
+    
     embed = discord.Embed(
         title=f"🔥 Clutch Analysis for {username}#{tag}",
-        description=f"Clutch performance over the last **{days} days** ({clutch_stats['total_matches']} matches)",
-        color=0x00FF00 if overall_clutch_rate >= 30 else 0xFF9900 if overall_clutch_rate >= 15 else 0xFF4655,
+        description=description,
+        color=embed_color,
         timestamp=datetime.now(timezone.utc)
     )
+    
+    # Handle case where no clutches detected even with estimation
+    if total_attempts == 0:
+        embed.add_field(
+            name="🔍 Analysis Results",
+            value=(
+                "**No clutch situations detected** in available match data.\n\n"
+                "**Possible reasons:**\n"
+                "• Match data lacks detailed round information\n"
+                "• Player performance didn't trigger clutch estimation\n"
+                "• Need more recent matches with detailed data\n"
+                "• No high-pressure situations occurred"
+            ),
+            inline=False
+        )
+        
+        embed.add_field(
+            name="💡 How to get better clutch analysis",
+            value=(
+                "1. Use `/fetch` to collect detailed match data\n"
+                "2. Play more competitive matches\n"
+                "3. Focus on situations where you're last alive\n"
+                "4. Return here after collecting more recent matches"
+            ),
+            inline=False
+        )
+        
+        embed.set_footer(text="Limited clutch data available • Use /fetch for detailed round analysis")
+        return embed
     
     # Overall Clutch Performance
     embed.add_field(
@@ -2206,13 +2515,16 @@ def create_clutch_embed(clutch_stats: Dict[str, Any], username: str, tag: str, d
     # Best Clutch & Performance Insights
     best_clutch = clutch_stats.get('best_clutch')
     if best_clutch:
+        round_info = best_clutch.get('round', '')
+        round_text = f"Round {round_info}" if round_info != 'estimated' else "Estimated"
+        
         embed.add_field(
             name="🏆 Best Clutch",
             value=(
                 f"**Type:** {best_clutch['type'].upper()}\n"
                 f"**Map:** {best_clutch['map']}\n"
                 f"**Agent:** {best_clutch['agent']}\n"
-                f"**Round:** {best_clutch['round']}"
+                f"**Round:** {round_text}"
             ),
             inline=True
         )
@@ -2234,7 +2546,7 @@ def create_clutch_embed(clutch_stats: Dict[str, Any], username: str, tag: str, d
         
         map_text = ""
         for map_name, map_data in sorted_maps:
-            if map_data['attempts'] >= 2:  # Only show maps with enough attempts
+            if map_data['attempts'] >= 1:  # Lower threshold due to limited data
                 rate = calc_percentage(map_data['wins'], map_data['attempts'])
                 map_text += f"**{map_name}:** {rate}% ({map_data['wins']}/{map_data['attempts']})\n"
         
@@ -2256,7 +2568,7 @@ def create_clutch_embed(clutch_stats: Dict[str, Any], username: str, tag: str, d
         
         agent_text = ""
         for agent, agent_data in sorted_agents:
-            if agent_data['attempts'] >= 2:  # Only show agents with enough attempts
+            if agent_data['attempts'] >= 1:  # Lower threshold due to limited data
                 rate = calc_percentage(agent_data['wins'], agent_data['attempts'])
                 agent_text += f"**{agent}:** {rate}% ({agent_data['wins']}/{agent_data['attempts']})\n"
         
@@ -2269,20 +2581,37 @@ def create_clutch_embed(clutch_stats: Dict[str, Any], username: str, tag: str, d
     
     # Performance Analysis
     performance_analysis = ""
+    if has_limitations:
+        performance_analysis = "⚠️ **Limited data analysis** - Results estimated from basic match statistics. "
+    
     if overall_clutch_rate >= 40:
-        performance_analysis = "🔥 Exceptional clutch player! You thrive under pressure."
+        performance_analysis += "🔥 Exceptional clutch player! You thrive under pressure."
     elif overall_clutch_rate >= 25:
-        performance_analysis = "💪 Strong clutch performance! You're reliable in tough situations."
+        performance_analysis += "💪 Strong clutch performance! You're reliable in tough situations."
     elif overall_clutch_rate >= 15:
-        performance_analysis = "👍 Decent clutch ability! Room for improvement in high-pressure moments."
+        performance_analysis += "👍 Decent clutch ability! Room for improvement in high-pressure moments."
     else:
-        performance_analysis = "📈 Focus on positioning and aim in clutch situations for improvement."
+        performance_analysis += "📈 Focus on positioning and aim in clutch situations for improvement."
     
     embed.add_field(
         name="📊 Performance Analysis",
         value=performance_analysis,
         inline=False
     )
+    
+    # Data quality notice
+    if has_limitations:
+        embed.add_field(
+            name="⚠️ Data Quality Notice",
+            value=(
+                "**Limited round data available** - Analysis includes:\n"
+                f"• {matches_with_detailed} matches with detailed round data\n"
+                f"• {matches_with_basic} matches with estimated clutch data\n"
+                "• Use `/fetch` for more accurate analysis\n"
+                "• Results may be conservative estimates"
+            ),
+            inline=False
+        )
     
     # Tips for improvement
     tips = []
@@ -2292,6 +2621,8 @@ def create_clutch_embed(clutch_stats: Dict[str, Any], username: str, tag: str, d
         tips.append("Use utility to isolate 1v2 situations")
     if total_attempts < clutch_stats['total_matches']:
         tips.append("Work on positioning to avoid early deaths")
+    if has_limitations:
+        tips.append("Use `/fetch` to collect detailed match data for better analysis")
     
     if tips:
         embed.add_field(
@@ -2300,7 +2631,12 @@ def create_clutch_embed(clutch_stats: Dict[str, Any], username: str, tag: str, d
             inline=False
         )
     
-    embed.set_footer(text=f"Clutch analysis based on {total_attempts} clutch situations • Use /fetch for more data")
+    footer_text = f"Clutch analysis based on {total_attempts} clutch situations"
+    if has_limitations:
+        footer_text += " (estimated)"
+    footer_text += " • Use /fetch for more data"
+    
+    embed.set_footer(text=footer_text)
     return embed
 
 @bot.tree.command(name="clutch", description="Analyze clutch performance (1v1, 1v2, 1v3+ situations)")
